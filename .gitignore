@@ -1,0 +1,27 @@
+# Data and output directories
+data/
+output/
+
+# Synthetic data generator
+generate_synthetic_data.py
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
