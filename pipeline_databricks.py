@@ -32,6 +32,12 @@ NGRAM_RANGE = (3, 5)           # character n-gram window (narrower = more specif
 TOP_N_PER_ROW = 5              # max neighbours kept per name (fewer = less transitive chaining)
 RAPIDFUZZ_THRESHOLD = 75       # RapidFuzz token_sort_ratio cutoff for verification pass
 
+# Pass 3: Re-cluster representatives for RECALL (relaxed thresholds)
+RECALL_COSINE_THRESHOLD = 0.60   # looser cosine to catch typo variants
+RECALL_NGRAM_RANGE = (2, 4)      # wider n-grams to catch more overlap
+RECALL_RAPIDFUZZ_THRESHOLD = 65  # RapidFuzz cutoff for recall pass
+RECALL_TOP_N = 10                # more neighbours for broader matching
+
 # Prefixes to remove (whole-word, case-insensitive)
 PREFIXES_TO_REMOVE = ["mr", "mrs", "miss", "ms", "dr", "moham"]
 
@@ -75,6 +81,10 @@ SIMILARITY_THRESHOLD = 0.85
 NGRAM_RANGE = (3, 5)
 TOP_N_PER_ROW = 5
 RAPIDFUZZ_THRESHOLD = 75
+RECALL_COSINE_THRESHOLD = 0.60
+RECALL_NGRAM_RANGE = (2, 4)
+RECALL_RAPIDFUZZ_THRESHOLD = 65
+RECALL_TOP_N = 10
 PREFIXES_TO_REMOVE = ["mr", "mrs", "miss", "ms", "dr", "moham"]
 
 # COMMAND ----------
@@ -204,7 +214,7 @@ print(f"  Unique after cleaning: {cleaning_map['cleaned_name'].nunique():,}")
 
 # COMMAND ----------
 
-print(f"\n[4/7] Clustering cleaned names (high-precision mode)...")
+print(f"\n[4/7] Clustering cleaned names (hierarchical: precision -> recall)...")
 t0 = time.time()
 
 # Get unique cleaned names
@@ -212,87 +222,156 @@ unique_cleaned = cleaning_map["cleaned_name"].unique()
 unique_cleaned = pd.Series([n for n in unique_cleaned if n.strip()], name="cleaned_name")
 n = len(unique_cleaned)
 
-print(f"  Vectorizing {n:,} unique cleaned names...")
+print(f"  {n:,} unique cleaned names to cluster")
 
-# ── Pass 1: TF-IDF + Cosine Similarity (coarse grouping) ─────────────────
-vectorizer = TfidfVectorizer(
-    analyzer="char_wb",
-    ngram_range=NGRAM_RANGE,
-    min_df=1,
-    max_df=0.95,
-    sublinear_tf=True,
-    dtype=np.float32,
+# ═══════════════════════════════════════════════════════════════════════════
+# PASS 1: High-precision cosine similarity (tight threshold)
+# ═══════════════════════════════════════════════════════════════════════════
+print(f"\n  --- Pass 1: Precision clustering (cosine >= {SIMILARITY_THRESHOLD}) ---")
+
+vectorizer_p1 = TfidfVectorizer(
+    analyzer="char_wb", ngram_range=NGRAM_RANGE,
+    min_df=1, max_df=0.95, sublinear_tf=True, dtype=np.float32,
 )
-tfidf_matrix = vectorizer.fit_transform(unique_cleaned)
-print(f"  TF-IDF matrix shape: {tfidf_matrix.shape} (nnz: {tfidf_matrix.nnz:,})")
+tfidf_p1 = vectorizer_p1.fit_transform(unique_cleaned)
+print(f"  TF-IDF: {tfidf_p1.shape} (nnz: {tfidf_p1.nnz:,})")
 
-print(f"  Computing sparse cosine similarity (threshold={SIMILARITY_THRESHOLD})...")
-similarity = awesome_cossim_topn(
-    tfidf_matrix,
-    tfidf_matrix.T,
-    ntop=TOP_N_PER_ROW,
-    lower_bound=SIMILARITY_THRESHOLD,
-    use_threads=True,
-    n_jobs=4,
+sim_p1 = awesome_cossim_topn(
+    tfidf_p1, tfidf_p1.T, ntop=TOP_N_PER_ROW,
+    lower_bound=SIMILARITY_THRESHOLD, use_threads=True, n_jobs=4,
 )
-similarity = similarity + similarity.T
-similarity.setdiag(0)
-print(f"  Similarity graph: {similarity.nnz:,} edges")
+sim_p1 = sim_p1 + sim_p1.T
+sim_p1.setdiag(0)
 
-n_components, labels = connected_components(
-    csgraph=similarity, directed=False, return_labels=True
-)
-print(f"  Pass 1 (cosine): {n_components:,} clusters")
+n_clusters_p1, labels_p1 = connected_components(csgraph=sim_p1, directed=False, return_labels=True)
+print(f"  Pass 1 result: {n_clusters_p1:,} clusters")
 
-# ── Pass 2: RapidFuzz Verification (split weak clusters) ─────────────────
-print(f"  Pass 2: Verifying clusters with RapidFuzz (threshold={RAPIDFUZZ_THRESHOLD})...")
+# ═══════════════════════════════════════════════════════════════════════════
+# PASS 2: RapidFuzz verification (split false merges)
+# ═══════════════════════════════════════════════════════════════════════════
+print(f"\n  --- Pass 2: RapidFuzz verification (split if score < {RAPIDFUZZ_THRESHOLD}) ---")
 
-cluster_df = pd.DataFrame({
-    "cleaned_name": unique_cleaned.values,
-    "cluster_id": labels,
-})
-
-next_cluster_id = cluster_df["cluster_id"].max() + 1
+cluster_df = pd.DataFrame({"cleaned_name": unique_cleaned.values, "cluster_id": labels_p1})
+next_cid = cluster_df["cluster_id"].max() + 1
 split_count = 0
 
 for cid in cluster_df["cluster_id"].unique():
     members = cluster_df[cluster_df["cluster_id"] == cid]["cleaned_name"].tolist()
     if len(members) <= 1:
         continue
-
-    # Pick the shortest member as anchor
     anchor = min(members, key=lambda x: (len(x), x))
-
-    # Check every other member against the anchor using token_sort_ratio
     for member in members:
         if member == anchor:
             continue
-        score = fuzz.token_sort_ratio(anchor, member)
-        if score < RAPIDFUZZ_THRESHOLD:
-            # Split this member into its own singleton cluster
-            cluster_df.loc[cluster_df["cleaned_name"] == member, "cluster_id"] = next_cluster_id
-            next_cluster_id += 1
+        if fuzz.token_sort_ratio(anchor, member) < RAPIDFUZZ_THRESHOLD:
+            cluster_df.loc[cluster_df["cleaned_name"] == member, "cluster_id"] = next_cid
+            next_cid += 1
             split_count += 1
 
-print(f"  Pass 2 split {split_count:,} weak members into singletons")
-final_clusters = cluster_df["cluster_id"].nunique()
-print(f"  Final clusters: {final_clusters:,} (was {n_components:,} before verification)")
+n_clusters_p2 = cluster_df["cluster_id"].nunique()
+print(f"  Split {split_count:,} weak members -> {n_clusters_p2:,} clusters")
 
-# Select representative name per cluster (shortest, then alphabetical)
+# Pick representative per cluster after Pass 2
 def pick_rep(group):
     sorted_names = sorted(group["cleaned_name"].unique(), key=lambda x: (len(x), x))
     return sorted_names[0] if sorted_names else ""
 
-reps = cluster_df.groupby("cluster_id").apply(pick_rep).reset_index()
-reps.columns = ["cluster_id", "representative_name"]
-cluster_df = cluster_df.merge(reps, on="cluster_id", how="left")
+reps_p2 = cluster_df.groupby("cluster_id").apply(pick_rep).reset_index()
+reps_p2.columns = ["cluster_id", "representative_name"]
+cluster_df = cluster_df.merge(reps_p2, on="cluster_id", how="left")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PASS 3: Re-cluster REPRESENTATIVES for RECALL (relaxed thresholds)
+# ═══════════════════════════════════════════════════════════════════════════
+print(f"\n  --- Pass 3: Recall re-clustering (cosine >= {RECALL_COSINE_THRESHOLD}, "
+      f"RapidFuzz >= {RECALL_RAPIDFUZZ_THRESHOLD}) ---")
+
+# Get distinct representatives from Pass 2
+rep_names = cluster_df[["cluster_id", "representative_name"]].drop_duplicates("cluster_id")
+rep_series = rep_names["representative_name"].reset_index(drop=True)
+n_reps = len(rep_series)
+print(f"  Re-clustering {n_reps:,} representative names...")
+
+# TF-IDF on representatives with wider n-grams
+vectorizer_p3 = TfidfVectorizer(
+    analyzer="char_wb", ngram_range=RECALL_NGRAM_RANGE,
+    min_df=1, max_df=0.95, sublinear_tf=True, dtype=np.float32,
+)
+tfidf_p3 = vectorizer_p3.fit_transform(rep_series)
+
+sim_p3 = awesome_cossim_topn(
+    tfidf_p3, tfidf_p3.T, ntop=RECALL_TOP_N,
+    lower_bound=RECALL_COSINE_THRESHOLD, use_threads=True, n_jobs=4,
+)
+sim_p3 = sim_p3 + sim_p3.T
+sim_p3.setdiag(0)
+
+n_super_clusters, super_labels = connected_components(csgraph=sim_p3, directed=False, return_labels=True)
+print(f"  Cosine pass: {n_reps:,} reps -> {n_super_clusters:,} super-clusters")
+
+# RapidFuzz verification on super-clusters
+rep_cluster_df = pd.DataFrame({
+    "representative_name": rep_series.values,
+    "super_cluster_id": super_labels,
+    "original_cluster_id": rep_names["cluster_id"].values,
+})
+
+next_super = rep_cluster_df["super_cluster_id"].max() + 1
+recall_split = 0
+
+for scid in rep_cluster_df["super_cluster_id"].unique():
+    sc_members = rep_cluster_df[rep_cluster_df["super_cluster_id"] == scid]["representative_name"].tolist()
+    if len(sc_members) <= 1:
+        continue
+    anchor = min(sc_members, key=lambda x: (len(x), x))
+    for member in sc_members:
+        if member == anchor:
+            continue
+        if fuzz.token_sort_ratio(anchor, member) < RECALL_RAPIDFUZZ_THRESHOLD:
+            rep_cluster_df.loc[rep_cluster_df["representative_name"] == member, "super_cluster_id"] = next_super
+            next_super += 1
+            recall_split += 1
+
+n_final_super = rep_cluster_df["super_cluster_id"].nunique()
+print(f"  RapidFuzz verification split {recall_split:,} -> {n_final_super:,} super-clusters")
+
+# Pick final representative per super-cluster
+def pick_super_rep(group):
+    sorted_names = sorted(group["representative_name"].unique(), key=lambda x: (len(x), x))
+    return sorted_names[0] if sorted_names else ""
+
+super_reps = rep_cluster_df.groupby("super_cluster_id").apply(pick_super_rep).reset_index()
+super_reps.columns = ["super_cluster_id", "final_representative"]
+rep_cluster_df = rep_cluster_df.merge(super_reps, on="super_cluster_id", how="left")
+
+# Map super-cluster IDs back to the main cluster_df
+# old cluster_id -> super_cluster_id + final_representative
+merge_map = rep_cluster_df[["original_cluster_id", "super_cluster_id", "final_representative"]].copy()
+merge_map.columns = ["cluster_id", "super_cluster_id", "final_representative"]
+
+cluster_df = cluster_df.drop(columns=["representative_name"]).merge(merge_map, on="cluster_id", how="left")
+cluster_df = cluster_df.rename(columns={
+    "super_cluster_id": "cluster_id_final",
+    "final_representative": "representative_name",
+})
+
+# Stats
+merged_count = n_clusters_p2 - n_final_super
+print(f"\n  === Hierarchical Clustering Summary ===")
+print(f"  Pass 1 (precision cosine):  {n:,} names -> {n_clusters_p1:,} clusters")
+print(f"  Pass 2 (RapidFuzz verify):  {n_clusters_p1:,} -> {n_clusters_p2:,} clusters (+{split_count} splits)")
+print(f"  Pass 3 (recall re-cluster): {n_clusters_p2:,} -> {n_final_super:,} clusters ({merged_count:,} merged for recall)")
+
+# Prepare final output columns
+cluster_df = cluster_df[["cleaned_name", "cluster_id_final", "representative_name"]].copy()
+cluster_df = cluster_df.rename(columns={"cluster_id_final": "cluster_id"})
 
 # Merge cluster info back to cleaning map
 full_map = cleaning_map.merge(cluster_df, on="cleaned_name", how="left")
 
 elapsed = time.time() - t0
-print(f"  Clustering completed in {elapsed:.1f}s")
-print(f"  Clusters: {full_map['cluster_id'].nunique():,}")
+print(f"  Total clustering time: {elapsed:.1f}s")
+print(f"  Final clusters: {full_map['cluster_id'].nunique():,}")
 
 # COMMAND ----------
 

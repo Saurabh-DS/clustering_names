@@ -36,6 +36,12 @@ TOP_N_PER_ROW = 5                # max neighbours kept per name (fewer = less tr
 MIN_CLUSTER_SIZE = 1             # clusters smaller than this are singletons
 RAPIDFUZZ_THRESHOLD = 75         # token_sort_ratio cutoff for verification pass
 
+# Pass 3: Re-cluster representatives for RECALL (relaxed thresholds)
+RECALL_COSINE_THRESHOLD = 0.60
+RECALL_NGRAM_RANGE = (2, 4)
+RECALL_RAPIDFUZZ_THRESHOLD = 65
+RECALL_TOP_N = 10
+
 # ─── Performance ──────────────────────────────────────────────────────────────
 USE_POLARS_FOR_MERGE = True      # use polars for the 30M-row merge step
 CHUNK_SIZE = 500_000             # rows per chunk when reading large CSVs

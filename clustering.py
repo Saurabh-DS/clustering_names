@@ -242,15 +242,92 @@ def cluster_names(
                 next_cluster_id += 1
                 split_count += 1
 
-    print(f"  Pass 2 split {split_count:,} weak members into singletons")
-    print(f"  Final clusters: {result['cluster_id'].nunique():,}")
+    n_clusters_p2 = result["cluster_id"].nunique()
+    print(f"  Pass 2 split {split_count:,} weak members -> {n_clusters_p2:,} clusters")
 
-    # Step 6: Pick representatives
+    # Step 6: Pick representatives after precision passes
     result = select_representatives(result)
+
+    # Step 7: Pass 3 — Re-cluster REPRESENTATIVES for RECALL
+    recall_cosine = config.RECALL_COSINE_THRESHOLD
+    recall_ngram = config.RECALL_NGRAM_RANGE
+    recall_fuzz = config.RECALL_RAPIDFUZZ_THRESHOLD
+    recall_topn = config.RECALL_TOP_N
+
+    print(f"\n  Pass 3: Recall re-clustering (cosine >= {recall_cosine}, "
+          f"RapidFuzz >= {recall_fuzz})...")
+
+    rep_names = result[["cluster_id", "representative_name"]].drop_duplicates("cluster_id")
+    rep_series = rep_names["representative_name"].reset_index(drop=True)
+    n_reps = len(rep_series)
+    print(f"  Re-clustering {n_reps:,} representative names...")
+
+    # TF-IDF on representatives with wider n-grams
+    tfidf_p3, _ = build_tfidf_matrix(rep_series, recall_ngram)
+    sim_p3 = compute_similarity(tfidf_p3, recall_cosine, recall_topn)
+    n_super, super_labels = connected_components(
+        csgraph=sim_p3, directed=False, return_labels=True
+    )
+    print(f"  Cosine pass: {n_reps:,} reps -> {n_super:,} super-clusters")
+
+    # RapidFuzz verification on super-clusters
+    rep_cluster_df = pd.DataFrame({
+        "representative_name": rep_series.values,
+        "super_cluster_id": super_labels,
+        "original_cluster_id": rep_names["cluster_id"].values,
+    })
+
+    next_super = rep_cluster_df["super_cluster_id"].max() + 1
+    recall_split = 0
+
+    for scid in rep_cluster_df["super_cluster_id"].unique():
+        sc_members = rep_cluster_df[rep_cluster_df["super_cluster_id"] == scid]["representative_name"].tolist()
+        if len(sc_members) <= 1:
+            continue
+        anchor = min(sc_members, key=lambda x: (len(x), x))
+        for member in sc_members:
+            if member == anchor:
+                continue
+            if fuzz.token_sort_ratio(anchor, member) < recall_fuzz:
+                rep_cluster_df.loc[rep_cluster_df["representative_name"] == member, "super_cluster_id"] = next_super
+                next_super += 1
+                recall_split += 1
+
+    n_final = rep_cluster_df["super_cluster_id"].nunique()
+    print(f"  RapidFuzz split {recall_split:,} -> {n_final:,} super-clusters")
+
+    # Pick final representative per super-cluster
+    def _pick_super_rep(group):
+        sorted_names = sorted(group["representative_name"].unique(), key=lambda x: (len(x), x))
+        return sorted_names[0] if sorted_names else ""
+
+    super_reps = rep_cluster_df.groupby("super_cluster_id").apply(_pick_super_rep).reset_index()
+    super_reps.columns = ["super_cluster_id", "final_representative"]
+    rep_cluster_df = rep_cluster_df.merge(super_reps, on="super_cluster_id", how="left")
+
+    # Map super-cluster IDs back to main result
+    merge_map = rep_cluster_df[["original_cluster_id", "super_cluster_id", "final_representative"]].copy()
+    merge_map.columns = ["cluster_id", "super_cluster_id", "final_representative"]
+
+    result = result.drop(columns=["representative_name"]).merge(merge_map, on="cluster_id", how="left")
+    result = result.rename(columns={
+        "super_cluster_id": "cluster_id_final",
+        "final_representative": "representative_name",
+    })
+
+    merged_count = n_clusters_p2 - n_final
+    print(f"\n  === Hierarchical Clustering Summary ===")
+    print(f"  Pass 1 (precision cosine):  {n:,} names -> {result['cluster_id'].nunique():,} clusters")
+    print(f"  Pass 2 (RapidFuzz verify):  -> {n_clusters_p2:,} clusters (+{split_count} splits)")
+    print(f"  Pass 3 (recall re-cluster): -> {n_final:,} clusters ({merged_count:,} merged for recall)")
+
+    # Final output columns
+    result = result[["cleaned_name", "cluster_id_final", "representative_name"]].copy()
+    result = result.rename(columns={"cluster_id_final": "cluster_id"})
 
     print(f"\n  Clustering complete.")
     print(f"  Input names: {n:,}")
-    print(f"  Clusters:    {result['cluster_id'].nunique():,}")
+    print(f"  Final clusters: {result['cluster_id'].nunique():,}")
     print(f"  Representative names: {result['representative_name'].nunique():,}")
 
     return result
