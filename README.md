@@ -46,8 +46,38 @@ python pipeline.py --input your_data.csv --output-dir ./output
 ## Performance Notes
 
 - **No nested loops**: Uses sparse matrix multiplication (`sparse_dot_topn`) instead of comparing every pair — handles 250k names in minutes.
-- **Memory-efficient**: Processes only unique names (~250k), not all 30M rows. Final merge uses Polars.
+- **Memory-efficient**: Processes only unique names (~250k), not all 30M rows. Final merge uses Polars (local) or Spark broadcast join (Databricks).
 - **Configurable threshold**: Tune `SIMILARITY_THRESHOLD` in `config.py` (default: 0.70). Lower = more aggressive merging, higher = more conservative.
+
+## Running on Databricks
+
+The `pipeline_databricks.py` file is a **Databricks notebook** (`.py` format with `# COMMAND ----------` cells). To use it:
+
+1. **Import** the file into your Databricks workspace (`Workspace > Import > File`)
+2. **Update the config** in the first code cell:
+   ```python
+   INPUT_TABLE = "your_catalog.your_schema.your_table"  # Delta table with PayeeName column
+   PAYEE_COLUMN = "PayeeName"                           # column name in your table
+   OUTPUT_MAPPING_TABLE = "your_catalog.your_schema.payee_mapping"
+   OUTPUT_FINAL_TABLE   = "your_catalog.your_schema.payee_resolved"
+   ```
+3. **Run all cells** — the notebook handles `%pip install` and library restart automatically.
+
+### How it works on Databricks
+
+| Step                  | Engine                   | Why                                               |
+| --------------------- | ------------------------ | ------------------------------------------------- |
+| Read 30M rows         | **Spark**                | Distributed read from Delta                       |
+| Extract unique names  | **Spark** `.distinct()`  | Parallel deduplication                            |
+| Clean 250k names      | **Pandas** (driver)      | Regex is single-threaded, 250k fits in memory     |
+| Cluster 250k names    | **Pandas** (driver)      | scikit-learn TF-IDF + sparse_dot_topn             |
+| Join back to 30M rows | **Spark broadcast join** | Mapping table (~250k) is broadcast to all workers |
+| Write results         | **Spark**                | Distributed write to Delta                        |
+
+### Recommended cluster spec
+
+- **Driver**: `Standard_DS4_v2` or similar (32 GB RAM) — requires enough memory for 250k names in pandas
+- **Workers**: 2-4 nodes for the 30M-row join
 
 ## Cleaning Pipeline
 
