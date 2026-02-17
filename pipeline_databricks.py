@@ -26,10 +26,11 @@ PAYEE_COLUMN = "PayeeName"                  # column containing the payee names
 OUTPUT_MAPPING_TABLE = "default.payee_mapping"       # cleaned name mapping
 OUTPUT_FINAL_TABLE   = "default.payee_resolved"      # full dataset with clusters
 
-# Clustering parameters
-SIMILARITY_THRESHOLD = 0.70    # cosine similarity cutoff
-NGRAM_RANGE = (2, 4)           # character n-gram window for TF-IDF
-TOP_N_PER_ROW = 10             # max neighbours kept per name in similarity graph
+# Clustering parameters (tuned for HIGH PRECISION — fewer false merges)
+SIMILARITY_THRESHOLD = 0.85    # cosine similarity cutoff (higher = stricter)
+NGRAM_RANGE = (3, 5)           # character n-gram window (narrower = more specific)
+TOP_N_PER_ROW = 5              # max neighbours kept per name (fewer = less transitive chaining)
+RAPIDFUZZ_THRESHOLD = 75       # RapidFuzz token_sort_ratio cutoff for verification pass
 
 # Prefixes to remove (whole-word, case-insensitive)
 PREFIXES_TO_REMOVE = ["mr", "mrs", "miss", "ms", "dr", "moham"]
@@ -63,15 +64,17 @@ from pyspark.sql.types import StringType
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sparse_dot_topn import awesome_cossim_topn
 from scipy.sparse.csgraph import connected_components
+from rapidfuzz import fuzz
 
 # Re-import config after library restart
 INPUT_TABLE = "default.payee_raw"
 PAYEE_COLUMN = "PayeeName"
 OUTPUT_MAPPING_TABLE = "default.payee_mapping"
 OUTPUT_FINAL_TABLE   = "default.payee_resolved"
-SIMILARITY_THRESHOLD = 0.70
-NGRAM_RANGE = (2, 4)
-TOP_N_PER_ROW = 10
+SIMILARITY_THRESHOLD = 0.85
+NGRAM_RANGE = (3, 5)
+TOP_N_PER_ROW = 5
+RAPIDFUZZ_THRESHOLD = 75
 PREFIXES_TO_REMOVE = ["mr", "mrs", "miss", "ms", "dr", "moham"]
 
 # COMMAND ----------
@@ -201,7 +204,7 @@ print(f"  Unique after cleaning: {cleaning_map['cleaned_name'].nunique():,}")
 
 # COMMAND ----------
 
-print(f"\n[4/7] Clustering cleaned names...")
+print(f"\n[4/7] Clustering cleaned names (high-precision mode)...")
 t0 = time.time()
 
 # Get unique cleaned names
@@ -211,7 +214,7 @@ n = len(unique_cleaned)
 
 print(f"  Vectorizing {n:,} unique cleaned names...")
 
-# TF-IDF with character n-grams
+# ── Pass 1: TF-IDF + Cosine Similarity (coarse grouping) ─────────────────
 vectorizer = TfidfVectorizer(
     analyzer="char_wb",
     ngram_range=NGRAM_RANGE,
@@ -223,7 +226,6 @@ vectorizer = TfidfVectorizer(
 tfidf_matrix = vectorizer.fit_transform(unique_cleaned)
 print(f"  TF-IDF matrix shape: {tfidf_matrix.shape} (nnz: {tfidf_matrix.nnz:,})")
 
-# Sparse cosine similarity
 print(f"  Computing sparse cosine similarity (threshold={SIMILARITY_THRESHOLD})...")
 similarity = awesome_cossim_topn(
     tfidf_matrix,
@@ -237,17 +239,44 @@ similarity = similarity + similarity.T
 similarity.setdiag(0)
 print(f"  Similarity graph: {similarity.nnz:,} edges")
 
-# Connected components
 n_components, labels = connected_components(
     csgraph=similarity, directed=False, return_labels=True
 )
-print(f"  Found {n_components:,} clusters")
+print(f"  Pass 1 (cosine): {n_components:,} clusters")
 
-# Build cluster dataframe
+# ── Pass 2: RapidFuzz Verification (split weak clusters) ─────────────────
+print(f"  Pass 2: Verifying clusters with RapidFuzz (threshold={RAPIDFUZZ_THRESHOLD})...")
+
 cluster_df = pd.DataFrame({
     "cleaned_name": unique_cleaned.values,
     "cluster_id": labels,
 })
+
+next_cluster_id = cluster_df["cluster_id"].max() + 1
+split_count = 0
+
+for cid in cluster_df["cluster_id"].unique():
+    members = cluster_df[cluster_df["cluster_id"] == cid]["cleaned_name"].tolist()
+    if len(members) <= 1:
+        continue
+
+    # Pick the shortest member as anchor
+    anchor = min(members, key=lambda x: (len(x), x))
+
+    # Check every other member against the anchor using token_sort_ratio
+    for member in members:
+        if member == anchor:
+            continue
+        score = fuzz.token_sort_ratio(anchor, member)
+        if score < RAPIDFUZZ_THRESHOLD:
+            # Split this member into its own singleton cluster
+            cluster_df.loc[cluster_df["cleaned_name"] == member, "cluster_id"] = next_cluster_id
+            next_cluster_id += 1
+            split_count += 1
+
+print(f"  Pass 2 split {split_count:,} weak members into singletons")
+final_clusters = cluster_df["cluster_id"].nunique()
+print(f"  Final clusters: {final_clusters:,} (was {n_components:,} before verification)")
 
 # Select representative name per cluster (shortest, then alphabetical)
 def pick_rep(group):

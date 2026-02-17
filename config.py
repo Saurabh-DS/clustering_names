@@ -30,10 +30,11 @@ JUNK_WORDS_TO_REMOVE = [
 ]
 
 # ─── Clustering Settings ─────────────────────────────────────────────────────
-SIMILARITY_THRESHOLD = 0.70      # cosine similarity cutoff for edges
-NGRAM_RANGE = (2, 4)             # character n-gram window
-TOP_N_PER_ROW = 10               # max neighbours kept per name in sparse sim
+SIMILARITY_THRESHOLD = 0.85      # cosine similarity cutoff (higher = stricter)
+NGRAM_RANGE = (3, 5)             # character n-gram window (narrower = more specific)
+TOP_N_PER_ROW = 5                # max neighbours kept per name (fewer = less transitive chaining)
 MIN_CLUSTER_SIZE = 1             # clusters smaller than this are singletons
+RAPIDFUZZ_THRESHOLD = 75         # token_sort_ratio cutoff for verification pass
 
 # ─── Performance ──────────────────────────────────────────────────────────────
 USE_POLARS_FOR_MERGE = True      # use polars for the 30M-row merge step

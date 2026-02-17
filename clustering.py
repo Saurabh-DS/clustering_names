@@ -19,6 +19,7 @@ from sparse_dot_topn import awesome_cossim_topn
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
 from tqdm import tqdm
+from rapidfuzz import fuzz
 
 import config
 
@@ -219,7 +220,32 @@ def cluster_names(
         "cluster_id": labels,
     })
 
-    # Step 5: Pick representatives
+    # Step 5: RapidFuzz verification pass — split weak cluster members
+    rapidfuzz_threshold = config.RAPIDFUZZ_THRESHOLD
+    print(f"  Pass 2: Verifying clusters with RapidFuzz (threshold={rapidfuzz_threshold})...")
+
+    next_cluster_id = result["cluster_id"].max() + 1
+    split_count = 0
+
+    for cid in result["cluster_id"].unique():
+        members = result[result["cluster_id"] == cid]["cleaned_name"].tolist()
+        if len(members) <= 1:
+            continue
+
+        anchor = min(members, key=lambda x: (len(x), x))
+        for member in members:
+            if member == anchor:
+                continue
+            score = fuzz.token_sort_ratio(anchor, member)
+            if score < rapidfuzz_threshold:
+                result.loc[result["cleaned_name"] == member, "cluster_id"] = next_cluster_id
+                next_cluster_id += 1
+                split_count += 1
+
+    print(f"  Pass 2 split {split_count:,} weak members into singletons")
+    print(f"  Final clusters: {result['cluster_id'].nunique():,}")
+
+    # Step 6: Pick representatives
     result = select_representatives(result)
 
     print(f"\n  Clustering complete.")
