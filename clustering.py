@@ -155,7 +155,7 @@ def select_representatives(
 
     reps = (
         df.groupby(cluster_col)
-        .apply(_pick_representative, include_groups=False)
+        .apply(_pick_representative)
         .reset_index()
     )
     reps.columns = [cluster_col, "representative_name"]

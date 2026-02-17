@@ -143,14 +143,22 @@ RE_DATES = re.compile(
     (?:
         \d{1,2}[/\-\.]\d{1,2}[/\-\.]\d{2,4}
       | \d{4}[/\-\.]\d{1,2}[/\-\.]\d{1,2}
-      | \d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{2,4}
-      | (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{2,4}
+      | \d{1,2}\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*(?:\s+\d{2,4})?
+      | (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s*\d{0,4}
       | \d{8}
     )
     """,
     re.IGNORECASE | re.VERBOSE,
 )
 
+# Junk words: bacs, micl, postcodeservices, ltd, limited
+RE_JUNK_WORDS = re.compile(
+    r"\b(bacs|micl|postcodeservices|postcode\s*services|ltd|limited)\b\.?\s*",
+    re.IGNORECASE,
+)
+
+RE_BRACKETS = re.compile(r"[(){}\[\]]")
+RE_NUMBERS = re.compile(r"\d+")
 RE_LEADING_NOISE = re.compile(r"^[^a-zA-Z]+")
 RE_TRAILING_NOISE = re.compile(r"[^a-zA-Z]+$")
 RE_MULTI_SPACE = re.compile(r"\s{2,}")
@@ -160,12 +168,15 @@ def clean_single(text):
     """Full cleaning pipeline for a single name string."""
     if not isinstance(text, str) or not text.strip():
         return ""
-    text = RE_DATES.sub("", text)
-    text = RE_PREFIXES.sub("", text)
-    text = RE_LEADING_NOISE.sub("", text)
-    text = RE_TRAILING_NOISE.sub("", text)
-    text = text.lower()
-    text = RE_MULTI_SPACE.sub(" ", text)
+    text = RE_DATES.sub("", text)          # 1. dates
+    text = RE_PREFIXES.sub("", text)       # 2. prefixes (Mr, Mrs, Dr, etc.)
+    text = RE_JUNK_WORDS.sub("", text)     # 3. junk words (bacs, micl, ltd, etc.)
+    text = RE_BRACKETS.sub("", text)       # 4. brackets
+    text = RE_NUMBERS.sub("", text)        # 5. all numbers
+    text = RE_LEADING_NOISE.sub("", text)  # 6. leading noise
+    text = RE_TRAILING_NOISE.sub("", text) # 6. trailing noise
+    text = text.lower()                    # 7. lowercase
+    text = RE_MULTI_SPACE.sub(" ", text)   # 7. collapse spaces
     return text.strip()
 
 
@@ -243,7 +254,7 @@ def pick_rep(group):
     sorted_names = sorted(group["cleaned_name"].unique(), key=lambda x: (len(x), x))
     return sorted_names[0] if sorted_names else ""
 
-reps = cluster_df.groupby("cluster_id").apply(pick_rep, include_groups=False).reset_index()
+reps = cluster_df.groupby("cluster_id").apply(pick_rep).reset_index()
 reps.columns = ["cluster_id", "representative_name"]
 cluster_df = cluster_df.merge(reps, on="cluster_id", how="left")
 

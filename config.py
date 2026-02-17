@@ -25,6 +25,10 @@ PREFIXES_TO_REMOVE = [
     "mr", "mrs", "miss", "ms", "dr", "moham",
 ]
 
+JUNK_WORDS_TO_REMOVE = [
+    "bacs", "micl", "postcodeservices", "ltd", "limited",
+]
+
 # ─── Clustering Settings ─────────────────────────────────────────────────────
 SIMILARITY_THRESHOLD = 0.70      # cosine similarity cutoff for edges
 NGRAM_RANGE = (2, 4)             # character n-gram window

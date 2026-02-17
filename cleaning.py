@@ -22,23 +22,35 @@ RE_PREFIXES = re.compile(
     re.IGNORECASE,
 )
 
-# Date patterns — covers most common formats
+# Date patterns — covers most common formats including short "03 Aug" style
 RE_DATES = re.compile(
     r"""
-    (?:                                     # Group of alternatives
-        \d{1,2}[/\-\.]\d{1,2}[/\-\.]\d{2,4}   # DD/MM/YYYY, MM-DD-YY, etc.
-      | \d{4}[/\-\.]\d{1,2}[/\-\.]\d{1,2}     # YYYY-MM-DD
-      | \d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun   # DD Mon YYYY
+    (?:                                         # Group of alternatives
+        \d{1,2}[/\-\.]\d{1,2}[/\-\.]\d{2,4}       # DD/MM/YYYY, MM-DD-YY, etc.
+      | \d{4}[/\-\.]\d{1,2}[/\-\.]\d{1,2}         # YYYY-MM-DD
+      | \d{1,2}\s*(?:Jan|Feb|Mar|Apr|May|Jun       # DD Mon (with optional year)
            |Jul|Aug|Sep|Oct|Nov|Dec)
-           [a-z]*\s+\d{2,4}
-      | (?:Jan|Feb|Mar|Apr|May|Jun              # Mon DD, YYYY
+           [a-z]*(?:\s+\d{2,4})?
+      | (?:Jan|Feb|Mar|Apr|May|Jun                  # Mon DD, YYYY
            |Jul|Aug|Sep|Oct|Nov|Dec)
-           [a-z]*\s+\d{1,2},?\s+\d{2,4}
-      | \d{8}                                   # DDMMYYYY (8 consecutive digits)
+           [a-z]*\s+\d{1,2},?\s*\d{0,4}
+      | \d{8}                                       # DDMMYYYY (8 consecutive digits)
     )
     """,
     re.IGNORECASE | re.VERBOSE,
 )
+
+# Junk words to remove as whole words: bacs, micl, postcodeservices, ltd, limited
+RE_JUNK_WORDS = re.compile(
+    r"\b(bacs|micl|postcodeservices|postcode\s*services|ltd|limited)\b\.?\s*",
+    re.IGNORECASE,
+)
+
+# Brackets and their contents (optional: remove content inside too)
+RE_BRACKETS = re.compile(r"[(){}\[\]]")
+
+# All digits
+RE_NUMBERS = re.compile(r"\d+")
 
 # Leading/trailing noise: non-alphanumeric and non-space characters
 RE_LEADING_NOISE = re.compile(r"^[^a-zA-Z]+")
@@ -60,6 +72,21 @@ def _remove_dates(text: str) -> str:
     return RE_DATES.sub("", text)
 
 
+def _remove_junk_words(text: str) -> str:
+    """Remove bacs, micl, postcodeservices, ltd, limited."""
+    return RE_JUNK_WORDS.sub("", text)
+
+
+def _remove_brackets(text: str) -> str:
+    """Remove all bracket characters."""
+    return RE_BRACKETS.sub("", text)
+
+
+def _remove_numbers(text: str) -> str:
+    """Remove all digits."""
+    return RE_NUMBERS.sub("", text)
+
+
 def _remove_noise(text: str) -> str:
     """Strip leading/trailing non-alpha characters."""
     text = RE_LEADING_NOISE.sub("", text)
@@ -79,15 +106,21 @@ def clean_single(text: str) -> str:
     Apply the full cleaning pipeline to a single string.
 
     Order matters:
-      1. Remove dates first (they contain digits that would be caught by noise removal)
-      2. Remove prefixes
-      3. Strip noise characters
-      4. Standardize case and whitespace
+      1. Remove dates first (they contain digits)
+      2. Remove prefixes (Mr, Mrs, etc.)
+      3. Remove junk words (bacs, micl, ltd, etc.)
+      4. Remove brackets
+      5. Remove all remaining numbers
+      6. Strip leading/trailing noise
+      7. Standardize case and whitespace
     """
     if not isinstance(text, str) or not text.strip():
         return ""
     text = _remove_dates(text)
     text = _remove_prefixes(text)
+    text = _remove_junk_words(text)
+    text = _remove_brackets(text)
+    text = _remove_numbers(text)
     text = _remove_noise(text)
     text = _standardize(text)
     return text
