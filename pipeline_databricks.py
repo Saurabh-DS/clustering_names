@@ -36,7 +36,9 @@ RAPIDFUZZ_THRESHOLD = 75       # RapidFuzz token_sort_ratio cutoff for verificat
 RECALL_COSINE_THRESHOLD = 0.60   # looser cosine to catch typo variants
 RECALL_NGRAM_RANGE = (2, 4)      # wider n-grams to catch more overlap
 RECALL_RAPIDFUZZ_THRESHOLD = 65  # RapidFuzz cutoff for recall pass
+# Pass 4: Final Fuzzy Merge (catching spacing/spelling distinct representatives)
 RECALL_TOP_N = 10                # more neighbours for broader matching
+PASS4_RAPIDFUZZ_THRESHOLD = 60   # Final check for subtle spelling/spacing differences
 
 # Prefixes to remove (whole-word, case-insensitive)
 PREFIXES_TO_REMOVE = ["mr", "mrs", "miss", "ms", "dr", "moham"]
@@ -85,6 +87,7 @@ RECALL_COSINE_THRESHOLD = 0.60
 RECALL_NGRAM_RANGE = (2, 4)
 RECALL_RAPIDFUZZ_THRESHOLD = 65
 RECALL_TOP_N = 10
+PASS4_RAPIDFUZZ_THRESHOLD = 60
 PREFIXES_TO_REMOVE = ["mr", "mrs", "miss", "ms", "dr", "moham"]
 
 # COMMAND ----------
@@ -355,12 +358,90 @@ cluster_df = cluster_df.rename(columns={
     "final_representative": "representative_name",
 })
 
+# ═══════════════════════════════════════════════════════════════════════════
+# PASS 4: Final Fuzzy Merge (catching spacing/spelling distinct representatives)
+# ═══════════════════════════════════════════════════════════════════════════
+print(f"\n  --- Pass 4: Final Fuzzy Merge (Cosine ~{RECALL_COSINE_THRESHOLD} + RapidFuzz >= {PASS4_RAPIDFUZZ_THRESHOLD}) ---")
+
+# Step 1: Distinct representatives from Pass 3
+p4_reps_df = cluster_df[["cluster_id_final", "representative_name"]].drop_duplicates("cluster_id_final")
+p4_rep_series = p4_reps_df["representative_name"].reset_index(drop=True)
+n_p4_reps = len(p4_reps_df)
+print(f"  Pass 4 input: {n_p4_reps:,} representatives from Pass 3")
+
+# Step 2: TF-IDF + Cosine (reuse Recall Params but fit on new reps)
+vectorizer_p4 = TfidfVectorizer(
+    analyzer="char_wb", ngram_range=RECALL_NGRAM_RANGE,
+    min_df=1, max_df=0.95, sublinear_tf=True, dtype=np.float32,
+)
+tfidf_p4 = vectorizer_p4.fit_transform(p4_rep_series)
+
+sim_p4 = awesome_cossim_topn(
+    tfidf_p4, tfidf_p4.T, ntop=RECALL_TOP_N,
+    lower_bound=RECALL_COSINE_THRESHOLD, use_threads=True, n_jobs=4,
+)
+sim_p4 = sim_p4 + sim_p4.T
+sim_p4.setdiag(0)
+
+# Step 3: Connected Components -> Meta Clusters
+n_meta_clusters, meta_labels = connected_components(csgraph=sim_p4, directed=False, return_labels=True)
+print(f"  Pass 4 Cosine: {n_p4_reps:,} reps -> {n_meta_clusters:,} meta-clusters")
+
+# Step 4: RapidFuzz Verify Meta Clusters
+meta_cluster_df = pd.DataFrame({
+    "representative_name": p4_rep_series.values,
+    "meta_cluster_id": meta_labels,
+    "p3_cluster_id": p4_reps_df["cluster_id_final"].values,
+})
+
+next_meta = meta_cluster_df["meta_cluster_id"].max() + 1
+p4_split = 0
+
+for mcid in meta_cluster_df["meta_cluster_id"].unique():
+    mc_members = meta_cluster_df[meta_cluster_df["meta_cluster_id"] == mcid]["representative_name"].tolist()
+    if len(mc_members) <= 1:
+        continue
+    
+    anchor = min(mc_members, key=lambda x: (len(x), x))
+    for member in mc_members:
+        if member == anchor:
+            continue
+        if fuzz.token_sort_ratio(anchor, member) < PASS4_RAPIDFUZZ_THRESHOLD:
+            meta_cluster_df.loc[meta_cluster_df["representative_name"] == member, "meta_cluster_id"] = next_meta
+            next_meta += 1
+            p4_split += 1
+
+n_final_meta = meta_cluster_df["meta_cluster_id"].nunique()
+print(f"  Pass 4 RapidFuzz split {p4_split:,} -> {n_final_meta:,} meta-clusters")
+
+# Step 5: Final Representative Selection
+def pick_meta_rep(group):
+    sorted_names = sorted(group["representative_name"].unique(), key=lambda x: (len(x), x))
+    return sorted_names[0] if sorted_names else ""
+
+meta_reps = meta_cluster_df.groupby("meta_cluster_id").apply(pick_meta_rep).reset_index()
+meta_reps.columns = ["meta_cluster_id", "final_representative_p4"]
+meta_cluster_df = meta_cluster_df.merge(meta_reps, on="meta_cluster_id", how="left")
+
+# Step 6: Map back to cluster_df
+merge_map_p4 = meta_cluster_df[["p3_cluster_id", "meta_cluster_id", "final_representative_p4"]].copy()
+merge_map_p4.columns = ["cluster_id_final", "cluster_id_final_p4", "representative_name_p4"]
+
+cluster_df = cluster_df.drop(columns=["representative_name"]).merge(merge_map_p4, on="cluster_id_final", how="left")
+cluster_df = cluster_df.drop(columns=["cluster_id_final"]).rename(columns={
+    "cluster_id_final_p4": "cluster_id_final",
+    "representative_name_p4": "representative_name",
+})
+
 # Stats
 merged_count = n_clusters_p2 - n_final_super
+merged_count_p4 = n_final_super - n_final_meta
+
 print(f"\n  === Hierarchical Clustering Summary ===")
 print(f"  Pass 1 (precision cosine):  {n:,} names -> {n_clusters_p1:,} clusters")
 print(f"  Pass 2 (RapidFuzz verify):  {n_clusters_p1:,} -> {n_clusters_p2:,} clusters (+{split_count} splits)")
 print(f"  Pass 3 (recall re-cluster): {n_clusters_p2:,} -> {n_final_super:,} clusters ({merged_count:,} merged for recall)")
+print(f"  Pass 4 (fuzzy merge):       {n_final_super:,} -> {n_final_meta:,} clusters ({merged_count_p4:,} merged for recall)")
 
 # Prepare final output columns
 cluster_df = cluster_df[["cleaned_name", "cluster_id_final", "representative_name"]].copy()

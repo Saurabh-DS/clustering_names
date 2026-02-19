@@ -213,6 +213,7 @@ def cluster_names(
 
     # Step 3: Connected components
     labels = find_clusters(similarity)
+    n_clusters_p1 = len(np.unique(labels))
 
     # Step 4: Build result dataframe
     result = pd.DataFrame({
@@ -316,10 +317,76 @@ def cluster_names(
     })
 
     merged_count = n_clusters_p2 - n_final
+# Step 8: Pass 4 — Final Fuzzy Merge
+    # ═══════════════════════════════════════════════════════════════════════════
+    pass4_fuzz = config.PASS4_RAPIDFUZZ_THRESHOLD
+    print(f"\n  Pass 4: Final Fuzzy Merge (Cosine ~{recall_cosine} + RapidFuzz >= {pass4_fuzz})...")
+
+    # Distinct representatives from Pass 3
+    p4_reps_df = result[["cluster_id_final", "representative_name"]].drop_duplicates("cluster_id_final")
+    p4_rep_series = p4_reps_df["representative_name"].reset_index(drop=True)
+    n_p4_reps = len(p4_reps_df)
+    print(f"  Pass 4 input: {n_p4_reps:,} representatives from Pass 3")
+
+    # TF-IDF + Cosine (reuse Recall Params but fit on new reps)
+    tfidf_p4, _ = build_tfidf_matrix(p4_rep_series, recall_ngram)
+    sim_p4 = compute_similarity(tfidf_p4, recall_cosine, recall_topn)
+    n_meta, meta_labels = connected_components(csgraph=sim_p4, directed=False, return_labels=True)
+    print(f"  Pass 4 Cosine: {n_p4_reps:,} reps -> {n_meta:,} meta-clusters")
+
+    # RapidFuzz Verify Meta Clusters
+    meta_cluster_df = pd.DataFrame({
+        "representative_name": p4_rep_series.values,
+        "meta_cluster_id": meta_labels,
+        "p3_cluster_id": p4_reps_df["cluster_id_final"].values,
+    })
+
+    next_meta = meta_cluster_df["meta_cluster_id"].max() + 1
+    p4_split = 0
+
+    for mcid in meta_cluster_df["meta_cluster_id"].unique():
+        mc_members = meta_cluster_df[meta_cluster_df["meta_cluster_id"] == mcid]["representative_name"].tolist()
+        if len(mc_members) <= 1:
+            continue
+        
+        anchor = min(mc_members, key=lambda x: (len(x), x))
+        for member in mc_members:
+            if member == anchor:
+                continue
+            if fuzz.token_sort_ratio(anchor, member) < pass4_fuzz:
+                meta_cluster_df.loc[meta_cluster_df["representative_name"] == member, "meta_cluster_id"] = next_meta
+                next_meta += 1
+                p4_split += 1
+
+    n_final_meta = meta_cluster_df["meta_cluster_id"].nunique()
+    print(f"  Pass 4 RapidFuzz split {p4_split:,} -> {n_final_meta:,} meta-clusters")
+
+    # Final Representative Selection
+    def _pick_meta_rep(group):
+        sorted_names = sorted(group["representative_name"].unique(), key=lambda x: (len(x), x))
+        return sorted_names[0] if sorted_names else ""
+
+    meta_reps = meta_cluster_df.groupby("meta_cluster_id").apply(_pick_meta_rep).reset_index()
+    meta_reps.columns = ["meta_cluster_id", "final_representative_p4"]
+    meta_cluster_df = meta_cluster_df.merge(meta_reps, on="meta_cluster_id", how="left")
+
+    # Map back to result
+    merge_map_p4 = meta_cluster_df[["p3_cluster_id", "meta_cluster_id", "final_representative_p4"]].copy()
+    merge_map_p4.columns = ["cluster_id_final", "cluster_id_final_p4", "representative_name_p4"]
+
+    result = result.drop(columns=["representative_name"]).merge(merge_map_p4, on="cluster_id_final", how="left")
+    result = result.drop(columns=["cluster_id_final"]).rename(columns={
+        "cluster_id_final_p4": "cluster_id_final",
+        "representative_name_p4": "representative_name",
+    })
+
+    merged_count_p4 = n_final - n_final_meta
+
     print(f"\n  === Hierarchical Clustering Summary ===")
-    print(f"  Pass 1 (precision cosine):  {n:,} names -> {result['cluster_id'].nunique():,} clusters")
+    print(f"  Pass 1 (precision cosine):  {n:,} names -> {n_clusters_p1:,} clusters")
     print(f"  Pass 2 (RapidFuzz verify):  -> {n_clusters_p2:,} clusters (+{split_count} splits)")
     print(f"  Pass 3 (recall re-cluster): -> {n_final:,} clusters ({merged_count:,} merged for recall)")
+    print(f"  Pass 4 (fuzzy merge):       -> {n_final_meta:,} clusters ({merged_count_p4:,} merged for recall)")
 
     # Final output columns
     result = result[["cleaned_name", "cluster_id_final", "representative_name"]].copy()
